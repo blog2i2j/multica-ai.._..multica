@@ -917,7 +917,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	slog.Info("issue created", append(logger.RequestAttrs(r), "issue_id", uuidToString(issue.ID), "title", issue.Title, "status", issue.Status, "workspace_id", workspaceID)...)
 	h.publish(protocol.EventIssueCreated, workspaceID, creatorType, actualCreatorID, map[string]any{"issue": resp})
 
-	// Only ready issues in todo are enqueued for agents.
+	// Enqueue agent task when an agent-assigned issue is created.
 	if issue.AssigneeType.Valid && issue.AssigneeID.Valid {
 		if h.shouldEnqueueAgentTask(r.Context(), issue) {
 			h.TaskService.EnqueueTaskForIssue(r.Context(), issue)
@@ -1112,11 +1112,20 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		"creator_id":          uuidToString(prevIssue.CreatorID),
 	})
 
-	// Reconcile task queue when assignee changes (not on status changes —
-	// agents manage issue status themselves via the CLI).
+	// Reconcile task queue when assignee changes.
 	if assigneeChanged {
 		h.TaskService.CancelTasksForIssue(r.Context(), issue.ID)
 
+		if h.shouldEnqueueAgentTask(r.Context(), issue) {
+			h.TaskService.EnqueueTaskForIssue(r.Context(), issue)
+		}
+	}
+
+	// Trigger the assigned agent when a member moves an issue out of backlog.
+	// Backlog acts as a parking lot — moving to an active status signals the
+	// issue is ready for work.
+	if statusChanged && !assigneeChanged && actorType == "member" &&
+		prevIssue.Status == "backlog" && issue.Status != "done" && issue.Status != "cancelled" {
 		if h.shouldEnqueueAgentTask(r.Context(), issue) {
 			h.TaskService.EnqueueTaskForIssue(r.Context(), issue)
 		}
@@ -1413,6 +1422,14 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 
 		if assigneeChanged {
 			h.TaskService.CancelTasksForIssue(r.Context(), issue.ID)
+			if h.shouldEnqueueAgentTask(r.Context(), issue) {
+				h.TaskService.EnqueueTaskForIssue(r.Context(), issue)
+			}
+		}
+
+		// Trigger agent when moving out of backlog (batch).
+		if statusChanged && !assigneeChanged && actorType == "member" &&
+			prevIssue.Status == "backlog" && issue.Status != "done" && issue.Status != "cancelled" {
 			if h.shouldEnqueueAgentTask(r.Context(), issue) {
 				h.TaskService.EnqueueTaskForIssue(r.Context(), issue)
 			}
