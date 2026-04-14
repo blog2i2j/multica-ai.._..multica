@@ -975,12 +975,11 @@ func TestResolveActor(t *testing.T) {
 	}
 }
 
-// TestBacklogToTodoTriggersAgent verifies that moving an agent-assigned issue
-// from "backlog" to "todo" enqueues an agent task.
-func TestBacklogToTodoTriggersAgent(t *testing.T) {
+// TestBacklogNoTriggerOnCreate verifies that creating a backlog issue with an
+// agent assignee does NOT enqueue a task — backlog is a parking lot.
+func TestBacklogNoTriggerOnCreate(t *testing.T) {
 	ctx := context.Background()
 
-	// Look up the test agent.
 	var agentID string
 	err := testPool.QueryRow(ctx,
 		`SELECT id FROM agent WHERE workspace_id = $1 AND name = $2`,
@@ -990,7 +989,55 @@ func TestBacklogToTodoTriggersAgent(t *testing.T) {
 		t.Fatalf("failed to find test agent: %v", err)
 	}
 
-	// Create a backlog issue assigned to the agent.
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title":         "Backlog no-trigger test",
+		"status":        "backlog",
+		"assignee_type": "agent",
+		"assignee_id":   agentID,
+	})
+	testHandler.CreateIssue(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateIssue: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var created IssueResponse
+	json.NewDecoder(w.Body).Decode(&created)
+
+	var taskCount int
+	err = testPool.QueryRow(ctx,
+		`SELECT count(*) FROM agent_task_queue WHERE issue_id = $1`,
+		created.ID,
+	).Scan(&taskCount)
+	if err != nil {
+		t.Fatalf("failed to count tasks: %v", err)
+	}
+	if taskCount != 0 {
+		t.Fatalf("expected no tasks for backlog issue on creation, got %d", taskCount)
+	}
+
+	// Cleanup
+	cleanupReq := newRequest("DELETE", "/api/issues/"+created.ID, nil)
+	cleanupReq = withURLParam(cleanupReq, "id", created.ID)
+	testHandler.DeleteIssue(httptest.NewRecorder(), cleanupReq)
+}
+
+// TestBacklogToTodoTriggersAgent verifies that moving an agent-assigned issue
+// from "backlog" to "todo" enqueues exactly one agent task (none on creation,
+// one on status transition).
+func TestBacklogToTodoTriggersAgent(t *testing.T) {
+	ctx := context.Background()
+
+	var agentID string
+	err := testPool.QueryRow(ctx,
+		`SELECT id FROM agent WHERE workspace_id = $1 AND name = $2`,
+		testWorkspaceID, "Handler Test Agent",
+	).Scan(&agentID)
+	if err != nil {
+		t.Fatalf("failed to find test agent: %v", err)
+	}
+
+	// Create a backlog issue assigned to the agent — should NOT trigger.
 	w := httptest.NewRecorder()
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":         "Backlog trigger test",
@@ -1006,10 +1053,7 @@ func TestBacklogToTodoTriggersAgent(t *testing.T) {
 	var created IssueResponse
 	json.NewDecoder(w.Body).Decode(&created)
 
-	// Clean up any tasks created by the initial assignment.
-	testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE issue_id = $1`, created.ID)
-
-	// Move the issue from backlog to todo.
+	// Move the issue from backlog to todo — should trigger.
 	w = httptest.NewRecorder()
 	req = newRequest("PUT", "/api/issues/"+created.ID, map[string]any{
 		"status": "todo",
@@ -1020,7 +1064,7 @@ func TestBacklogToTodoTriggersAgent(t *testing.T) {
 		t.Fatalf("UpdateIssue: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 
-	// Verify a task was enqueued.
+	// Verify exactly one task was enqueued (from the status transition, not creation).
 	var taskCount int
 	err = testPool.QueryRow(ctx,
 		`SELECT count(*) FROM agent_task_queue WHERE issue_id = $1 AND agent_id = $2 AND status = 'queued'`,
@@ -1029,8 +1073,8 @@ func TestBacklogToTodoTriggersAgent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to count tasks: %v", err)
 	}
-	if taskCount == 0 {
-		t.Fatal("expected agent task to be enqueued when moving from backlog to todo")
+	if taskCount != 1 {
+		t.Fatalf("expected exactly 1 task after backlog->todo transition, got %d", taskCount)
 	}
 
 	// Cleanup
